@@ -11,14 +11,12 @@ func NewRouter(gh *game.Handler) http.Handler {
 	r := chi.NewRouter()
 
 	r.Route("/api", func(api chi.Router) {
-
-		// Group all game routes together
 		api.Route("/games", func(gr chi.Router) {
-			gr.Post("/", gh.CreateGame)           // POST /api/games
-			gr.Get("/{id}", gh.GetGame)           // GET /api/games/{id}
-			gr.Post("/{id}/throws", gh.PostThrow) // POST /api/games/{id}/throws
+			gr.Post("/", gh.CreateGame)             // POST /api/games
+			gr.Get("/{id}", gh.GetGame)             // GET /api/games/{id}
+			gr.Post("/{id}/throws", gh.PostThrow)   // POST /api/games/{id}/throws
+			gr.Post("/{id}/undo", gh.UndoLastThrow) // POST /api/games/{id}/undo
 		})
-
 	})
 
 	return r

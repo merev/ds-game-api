@@ -19,6 +19,7 @@ func NewRepository(db *pgxpool.Pool) *Repository {
 	return &Repository{db: db}
 }
 
+//
 // -----------------------------------------------------------------------------
 // Game creation & loading
 // -----------------------------------------------------------------------------
@@ -29,7 +30,6 @@ func (r *Repository) CreateGame(ctx context.Context, req CreateGameRequest) (Gam
 		return GameState{}, errors.New("at least one player is required")
 	}
 
-	// Read config from nested struct
 	mode := strings.TrimSpace(req.Config.Mode)
 	if mode == "" {
 		return GameState{}, errors.New("mode is required")
@@ -45,7 +45,6 @@ func (r *Repository) CreateGame(ctx context.Context, req CreateGameRequest) (Gam
 	if err != nil {
 		return GameState{}, err
 	}
-	// Ensure rollback if we return before Commit
 	defer func() {
 		_ = tx.Rollback(ctx)
 	}()
@@ -76,13 +75,27 @@ VALUES ($1, $2, $3);
 		return GameState{}, err
 	}
 
-	// Now load the full game state with players and (currently empty) history.
-	return r.getGameState(ctx, gameID)
+	state, err := r.getGameState(ctx, gameID)
+	if err != nil {
+		return GameState{}, err
+	}
+	if err := r.syncGameStatus(ctx, &state); err != nil {
+		return GameState{}, err
+	}
+
+	return state, nil
 }
 
 // GetGame loads a game and returns a GameState.
 func (r *Repository) GetGame(ctx context.Context, gameID string) (GameState, error) {
-	return r.getGameState(ctx, gameID)
+	state, err := r.getGameState(ctx, gameID)
+	if err != nil {
+		return GameState{}, err
+	}
+	if err := r.syncGameStatus(ctx, &state); err != nil {
+		return GameState{}, err
+	}
+	return state, nil
 }
 
 // getGameState reads from games + game_players + players + throws
@@ -176,8 +189,9 @@ ORDER BY created_at ASC, id ASC;
 	return state, nil
 }
 
+//
 // -----------------------------------------------------------------------------
-// Throws / scoring
+// Throws / scoring (X01 + undo)
 // -----------------------------------------------------------------------------
 
 // AddThrow inserts a new throw and returns the updated GameState.
@@ -193,15 +207,19 @@ func (r *Repository) AddThrow(ctx context.Context, gameID string, req CreateThro
 		return GameState{}, errors.New("visitScore must be between 0 and 180")
 	}
 
-	// Load current state to validate player & turn
-	state, err := r.getGameState(ctx, gameID)
+	// Load current state to validate membership & turn / finished state.
+	stateBefore, err := r.getGameState(ctx, gameID)
 	if err != nil {
 		return GameState{}, err
 	}
 
+	if stateBefore.Status == "finished" {
+		return GameState{}, errors.New("game is already finished")
+	}
+
 	// Ensure player is part of this game
 	playerInGame := false
-	for _, p := range state.Players {
+	for _, p := range stateBefore.Players {
 		if p.ID == req.PlayerID {
 			playerInGame = true
 			break
@@ -212,7 +230,7 @@ func (r *Repository) AddThrow(ctx context.Context, gameID string, req CreateThro
 	}
 
 	// Enforce turn order: only currentPlayerId is allowed to throw
-	if state.CurrentPlayerID != "" && state.CurrentPlayerID != req.PlayerID {
+	if stateBefore.CurrentPlayerID != "" && stateBefore.CurrentPlayerID != req.PlayerID {
 		return GameState{}, fmt.Errorf("not this player's turn")
 	}
 
@@ -226,26 +244,76 @@ VALUES ($1, $2, $3, $4);
 	}
 
 	// Reload full state after the new throw
-	return r.getGameState(ctx, gameID)
+	stateAfter, err := r.getGameState(ctx, gameID)
+	if err != nil {
+		return GameState{}, err
+	}
+	if err := r.syncGameStatus(ctx, &stateAfter); err != nil {
+		return GameState{}, err
+	}
+
+	return stateAfter, nil
+}
+
+// UndoLastThrow deletes the most recent throw for a game and returns the updated GameState.
+func (r *Repository) UndoLastThrow(ctx context.Context, gameID string) (GameState, error) {
+	// Find last throw
+	var lastThrowID string
+	err := r.db.QueryRow(ctx, `
+SELECT id::text
+FROM throws
+WHERE game_id = $1
+ORDER BY created_at DESC, id DESC
+LIMIT 1;
+`, gameID).Scan(&lastThrowID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return GameState{}, errors.New("no throws to undo")
+		}
+		return GameState{}, err
+	}
+
+	// Delete it
+	if _, err := r.db.Exec(ctx, `
+DELETE FROM throws
+WHERE id = $1;
+`, lastThrowID); err != nil {
+		return GameState{}, err
+	}
+
+	// Reload state after undo
+	state, err := r.getGameState(ctx, gameID)
+	if err != nil {
+		return GameState{}, err
+	}
+	if err := r.syncGameStatus(ctx, &state); err != nil {
+		return GameState{}, err
+	}
+
+	return state, nil
 }
 
 // computeScores fills state.Scores and state.CurrentPlayerId based on mode + history.
-// For now we implement a simple X01-like scoring model and keep other modes minimal.
+// For now we implement an X01-like scoring model:
+//   - Starting score (default 501 if not provided)
+//   - Bust if score < 0
+//   - If double-out is enabled, leaving 1 is a bust (can't finish on 1)
+//   - Reaching 0 is considered checkout (we don't validate last dart is a double,
+//     because we don't have per-dart info yet).
 func (r *Repository) computeScores(state *GameState) {
-	// Default: if no players, nothing to do.
 	if len(state.Players) == 0 {
 		state.Scores = []PlayerScore{}
 		state.CurrentPlayerID = ""
 		return
 	}
 
-	// Map players by ID and remember order.
+	// Map playerID → index
 	playerIndex := make(map[string]int, len(state.Players))
 	for i, p := range state.Players {
 		playerIndex[p.ID] = i
 	}
 
-	// Initialize scores slice with entries for each player.
+	// Initialize scores with one entry per player.
 	scores := make([]PlayerScore, len(state.Players))
 	for i, p := range state.Players {
 		scores[i] = PlayerScore{
@@ -253,45 +321,44 @@ func (r *Repository) computeScores(state *GameState) {
 		}
 	}
 
-	// Starting score for X01; if not specified, default to 501.
-	start := 0
+	// Default starting score
+	start := 501
 	if state.Config.StartingScore != nil {
 		start = *state.Config.StartingScore
-	} else {
-		start = 501
 	}
 
-	// Only apply scoring if mode is X01.
-	// For other modes we just keep remaining undefined.
+	// Only track remaining for X01.
+	remaining := make([]int, len(state.Players))
 	if state.Config.Mode == "X01" {
-		remaining := make([]int, len(state.Players))
 		for i := range remaining {
 			remaining[i] = start
-			// initialize remaining in scores as well
 			val := remaining[i]
 			scores[i].Remaining = &val
 		}
 
-		// Process throws in order; simple model: apply visitScore unless it would overshoot < 0.
-		// (We don't implement full double-out / bust rules yet.)
 		for _, t := range state.History {
 			idx, ok := playerIndex[t.PlayerID]
 			if !ok {
-				continue // throw from unknown player? skip
-			}
-
-			cur := remaining[idx]
-			candidate := cur - t.VisitScore
-			if candidate < 0 {
-				// Bust: ignore visit, score stays.
 				continue
 			}
 
-			remaining[idx] = candidate
+			cur := remaining[idx]
+			cand := cur - t.VisitScore
+
+			// Bust rules:
+			// - If result < 0, bust (ignore this visit)
+			// - If double-out and result == 1, bust
+			if cand < 0 {
+				continue
+			}
+			if state.Config.DoubleOut && cand == 1 {
+				continue
+			}
+
+			// Accept the visit
+			remaining[idx] = cand
 			visit := t.VisitScore
 			scores[idx].LastVisit = &visit
-
-			// Update remaining pointer
 			val := remaining[idx]
 			scores[idx].Remaining = &val
 		}
@@ -304,7 +371,6 @@ func (r *Repository) computeScores(state *GameState) {
 		last := state.History[len(state.History)-1]
 		lastIdx, ok := playerIndex[last.PlayerID]
 		if !ok {
-			// Fallback
 			state.CurrentPlayerID = state.Players[0].ID
 		} else {
 			nextIdx := (lastIdx + 1) % len(state.Players)
@@ -313,4 +379,41 @@ func (r *Repository) computeScores(state *GameState) {
 	}
 
 	state.Scores = scores
+}
+
+// syncGameStatus updates the games.status field based on scores + history:
+// - finished: any player has remaining == 0
+// - in_progress: at least one throw and no winner
+// - pending: no throws
+func (r *Repository) syncGameStatus(ctx context.Context, state *GameState) error {
+	newStatus := "pending"
+
+	finished := false
+	for _, s := range state.Scores {
+		if s.Remaining != nil && *s.Remaining == 0 {
+			finished = true
+			break
+		}
+	}
+
+	if finished {
+		newStatus = "finished"
+	} else if len(state.History) > 0 {
+		newStatus = "in_progress"
+	}
+
+	if newStatus == state.Status {
+		return nil
+	}
+
+	if _, err := r.db.Exec(ctx, `
+UPDATE games
+SET status = $1
+WHERE id = $2;
+`, newStatus, state.ID); err != nil {
+		return err
+	}
+
+	state.Status = newStatus
+	return nil
 }
