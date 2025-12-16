@@ -54,6 +54,17 @@ CREATE TABLE IF NOT EXISTS game_players (
 );
 `
 
+	const throwsTable = `
+CREATE TABLE IF NOT EXISTS throws (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    game_id      UUID NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+    player_id    UUID NOT NULL REFERENCES players(id) ON DELETE RESTRICT,
+    visit_score  INT NOT NULL,
+    darts_thrown INT NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+`
+
 	if _, err := db.Exec(ctx, enablePgcrypto); err != nil {
 		return err
 	}
@@ -61,6 +72,9 @@ CREATE TABLE IF NOT EXISTS game_players (
 		return err
 	}
 	if _, err := db.Exec(ctx, gamePlayersTable); err != nil {
+		return err
+	}
+	if _, err := db.Exec(ctx, throwsTable); err != nil {
 		return err
 	}
 
