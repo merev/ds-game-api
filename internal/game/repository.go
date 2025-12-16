@@ -19,18 +19,21 @@ func NewRepository(db *pgxpool.Pool) *Repository {
 	return &Repository{db: db}
 }
 
+// CreateGame inserts a game row and its game_players, then returns the full Game.
 func (r *Repository) CreateGame(ctx context.Context, req CreateGameRequest) (Game, error) {
 	if len(req.PlayerIDs) == 0 {
 		return Game{}, errors.New("at least one player is required")
 	}
-	req.Mode = strings.TrimSpace(req.Mode)
-	if req.Mode == "" {
+
+	// Read config from nested struct
+	mode := strings.TrimSpace(req.Config.Mode)
+	if mode == "" {
 		return Game{}, errors.New("mode is required")
 	}
-	if req.Legs <= 0 {
+	if req.Config.Legs <= 0 {
 		return Game{}, errors.New("legs must be > 0")
 	}
-	if req.Sets <= 0 {
+	if req.Config.Sets <= 0 {
 		return Game{}, errors.New("sets must be > 0")
 	}
 
@@ -38,6 +41,7 @@ func (r *Repository) CreateGame(ctx context.Context, req CreateGameRequest) (Gam
 	if err != nil {
 		return Game{}, err
 	}
+	// Ensure rollback if we return before Commit
 	defer func() {
 		_ = tx.Rollback(ctx)
 	}()
@@ -49,7 +53,7 @@ func (r *Repository) CreateGame(ctx context.Context, req CreateGameRequest) (Gam
 INSERT INTO games (mode, starting_score, legs, sets, double_out)
 VALUES ($1, $2, $3, $4, $5)
 RETURNING id::text, created_at;
-`, req.Mode, req.StartingScore, req.Legs, req.Sets, req.DoubleOut).
+`, mode, req.Config.StartingScore, req.Config.Legs, req.Config.Sets, req.Config.DoubleOut).
 		Scan(&gameID, &createdAt)
 	if err != nil {
 		return Game{}, err
@@ -72,6 +76,7 @@ VALUES ($1, $2, $3);
 	return r.GetGame(ctx, gameID)
 }
 
+// GetGame loads a game row and its players and returns a Game struct.
 func (r *Repository) GetGame(ctx context.Context, gameID string) (Game, error) {
 	var g Game
 	var startingScore *int
@@ -98,6 +103,7 @@ WHERE id = $1;
 	}
 	g.Config.StartingScore = startingScore
 
+	// Load players for this game
 	rows, err := r.db.Query(ctx, `
 SELECT p.id::text, p.name, gp.seat
 FROM game_players gp
