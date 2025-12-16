@@ -19,6 +19,10 @@ func NewRepository(db *pgxpool.Pool) *Repository {
 	return &Repository{db: db}
 }
 
+// -----------------------------------------------------------------------------
+// Game creation & loading
+// -----------------------------------------------------------------------------
+
 // CreateGame inserts a game row and its game_players, then returns the full GameState.
 func (r *Repository) CreateGame(ctx context.Context, req CreateGameRequest) (GameState, error) {
 	if len(req.PlayerIDs) == 0 {
@@ -72,17 +76,17 @@ VALUES ($1, $2, $3);
 		return GameState{}, err
 	}
 
-	// Now load the full game state with players.
+	// Now load the full game state with players and (currently empty) history.
 	return r.getGameState(ctx, gameID)
 }
 
-// GetGame loads a game and returns a GameState struct.
+// GetGame loads a game and returns a GameState.
 func (r *Repository) GetGame(ctx context.Context, gameID string) (GameState, error) {
 	return r.getGameState(ctx, gameID)
 }
 
-// getGameState is an internal helper that reads from games + game_players + players
-// and constructs a GameState with empty scores/history for now.
+// getGameState reads from games + game_players + players + throws
+// and constructs a GameState with computed scores & current player.
 func (r *Repository) getGameState(ctx context.Context, gameID string) (GameState, error) {
 	var state GameState
 	var startingScore *int
@@ -110,7 +114,7 @@ WHERE id = $1;
 	}
 	state.Config.StartingScore = startingScore
 
-	// Load players for this game
+	// Load players (seating order)
 	rows, err := r.db.Query(ctx, `
 SELECT p.id::text, p.name, gp.seat
 FROM game_players gp
@@ -135,24 +139,178 @@ ORDER BY gp.seat ASC;
 		return GameState{}, err
 	}
 
-	// ---- Temporary scoring scaffolding ----
-	// Until we implement real scoring / throws, we:
-	// - create an empty score object per player
-	// - set current player to the first player
-	state.Scores = make([]PlayerScore, 0, len(state.Players))
-	for _, p := range state.Players {
-		state.Scores = append(state.Scores, PlayerScore{
-			PlayerID: p.ID,
-			// Remaining / LastVisit / LastThreeDarts left nil/zero for now
-		})
+	// Load throws history
+	trows, err := r.db.Query(ctx, `
+SELECT id::text, game_id::text, player_id::text, visit_score, darts_thrown, created_at
+FROM throws
+WHERE game_id = $1
+ORDER BY created_at ASC, id ASC;
+`, state.ID)
+	if err != nil {
+		return GameState{}, err
 	}
+	defer trows.Close()
 
-	if len(state.Players) > 0 {
-		state.CurrentPlayerID = state.Players[0].ID
-	}
-
-	// No history yet, we haven't implemented throws.
 	state.History = make([]Throw, 0)
+	for trows.Next() {
+		var t Throw
+		if err := trows.Scan(
+			&t.ID,
+			&t.GameID,
+			&t.PlayerID,
+			&t.VisitScore,
+			&t.DartsThrown,
+			&t.CreatedAt,
+		); err != nil {
+			return GameState{}, err
+		}
+		state.History = append(state.History, t)
+	}
+	if err := trows.Err(); err != nil {
+		return GameState{}, err
+	}
+
+	// Compute scores + currentPlayer based on mode & history
+	r.computeScores(&state)
 
 	return state, nil
+}
+
+// -----------------------------------------------------------------------------
+// Throws / scoring
+// -----------------------------------------------------------------------------
+
+// AddThrow inserts a new throw and returns the updated GameState.
+func (r *Repository) AddThrow(ctx context.Context, gameID string, req CreateThrowRequest) (GameState, error) {
+	req.PlayerID = strings.TrimSpace(req.PlayerID)
+	if req.PlayerID == "" {
+		return GameState{}, errors.New("playerId is required")
+	}
+	if req.DartsThrown < 1 || req.DartsThrown > 3 {
+		return GameState{}, errors.New("dartsThrown must be between 1 and 3")
+	}
+	if req.VisitScore < 0 || req.VisitScore > 180 {
+		return GameState{}, errors.New("visitScore must be between 0 and 180")
+	}
+
+	// Load current state to validate player & turn
+	state, err := r.getGameState(ctx, gameID)
+	if err != nil {
+		return GameState{}, err
+	}
+
+	// Ensure player is part of this game
+	playerInGame := false
+	for _, p := range state.Players {
+		if p.ID == req.PlayerID {
+			playerInGame = true
+			break
+		}
+	}
+	if !playerInGame {
+		return GameState{}, errors.New("player is not part of this game")
+	}
+
+	// Enforce turn order: only currentPlayerId is allowed to throw
+	if state.CurrentPlayerID != "" && state.CurrentPlayerID != req.PlayerID {
+		return GameState{}, fmt.Errorf("not this player's turn")
+	}
+
+	// Insert throw
+	_, err = r.db.Exec(ctx, `
+INSERT INTO throws (game_id, player_id, visit_score, darts_thrown)
+VALUES ($1, $2, $3, $4);
+`, gameID, req.PlayerID, req.VisitScore, req.DartsThrown)
+	if err != nil {
+		return GameState{}, err
+	}
+
+	// Reload full state after the new throw
+	return r.getGameState(ctx, gameID)
+}
+
+// computeScores fills state.Scores and state.CurrentPlayerId based on mode + history.
+// For now we implement a simple X01-like scoring model and keep other modes minimal.
+func (r *Repository) computeScores(state *GameState) {
+	// Default: if no players, nothing to do.
+	if len(state.Players) == 0 {
+		state.Scores = []PlayerScore{}
+		state.CurrentPlayerID = ""
+		return
+	}
+
+	// Map players by ID and remember order.
+	playerIndex := make(map[string]int, len(state.Players))
+	for i, p := range state.Players {
+		playerIndex[p.ID] = i
+	}
+
+	// Initialize scores slice with entries for each player.
+	scores := make([]PlayerScore, len(state.Players))
+	for i, p := range state.Players {
+		scores[i] = PlayerScore{
+			PlayerID: p.ID,
+		}
+	}
+
+	// Starting score for X01; if not specified, default to 501.
+	start := 0
+	if state.Config.StartingScore != nil {
+		start = *state.Config.StartingScore
+	} else {
+		start = 501
+	}
+
+	// Only apply scoring if mode is X01.
+	// For other modes we just keep remaining undefined.
+	if state.Config.Mode == "X01" {
+		remaining := make([]int, len(state.Players))
+		for i := range remaining {
+			remaining[i] = start
+			// initialize remaining in scores as well
+			val := remaining[i]
+			scores[i].Remaining = &val
+		}
+
+		// Process throws in order; simple model: apply visitScore unless it would overshoot < 0.
+		// (We don't implement full double-out / bust rules yet.)
+		for _, t := range state.History {
+			idx, ok := playerIndex[t.PlayerID]
+			if !ok {
+				continue // throw from unknown player? skip
+			}
+
+			cur := remaining[idx]
+			candidate := cur - t.VisitScore
+			if candidate < 0 {
+				// Bust: ignore visit, score stays.
+				continue
+			}
+
+			remaining[idx] = candidate
+			visit := t.VisitScore
+			scores[idx].LastVisit = &visit
+
+			// Update remaining pointer
+			val := remaining[idx]
+			scores[idx].Remaining = &val
+		}
+	}
+
+	// Determine current player based on last throw; if no throws, first player.
+	if len(state.History) == 0 {
+		state.CurrentPlayerID = state.Players[0].ID
+	} else {
+		last := state.History[len(state.History)-1]
+		lastIdx, ok := playerIndex[last.PlayerID]
+		if !ok {
+			// Fallback
+			state.CurrentPlayerID = state.Players[0].ID
+		} else {
+			nextIdx := (lastIdx + 1) % len(state.Players)
+			state.CurrentPlayerID = state.Players[nextIdx].ID
+		}
+	}
+
+	state.Scores = scores
 }

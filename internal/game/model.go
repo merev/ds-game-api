@@ -54,6 +54,12 @@ type Throw struct {
 	CreatedAt   time.Time `json:"createdAt"`
 }
 
+type CreateThrowRequest struct {
+	PlayerID    string `json:"playerId"`
+	VisitScore  int    `json:"visitScore"`
+	DartsThrown int    `json:"dartsThrown"`
+}
+
 type GameState struct {
 	ID              string        `json:"id"`
 	Config          GameConfig    `json:"config"`

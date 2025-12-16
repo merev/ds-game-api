@@ -57,6 +57,32 @@ func (h *Handler) GetGame(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, state)
 }
 
+// POST /api/games/{id}/throws
+func (h *Handler) PostThrow(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+
+	id := chi.URLParam(r, "id")
+	if id == "" {
+		http.Error(w, "missing game id", http.StatusBadRequest)
+		return
+	}
+
+	var req CreateThrowRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+
+	state, err := h.repo.AddThrow(ctx, id, req)
+	if err != nil {
+		http.Error(w, "failed to register throw: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, state)
+}
+
 // Helper to write JSON responses.
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
