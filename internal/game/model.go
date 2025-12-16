@@ -37,3 +37,30 @@ type CreateGameRequest struct {
 	Config    GameConfig `json:"config"`
 	PlayerIDs []string   `json:"playerIds"`
 }
+
+type PlayerScore struct {
+	PlayerID  string `json:"playerId"`
+	Remaining *int   `json:"remaining,omitempty"`
+	LastVisit *int   `json:"lastVisit,omitempty"`
+	LastThree []int  `json:"lastThreeDarts,omitempty"`
+}
+
+type Throw struct {
+	ID          string    `json:"id"`
+	GameID      string    `json:"gameId"`
+	PlayerID    string    `json:"playerId"`
+	VisitScore  int       `json:"visitScore"`
+	DartsThrown int       `json:"dartsThrown"`
+	CreatedAt   time.Time `json:"createdAt"`
+}
+
+type GameState struct {
+	ID              string        `json:"id"`
+	Config          GameConfig    `json:"config"`
+	Status          string        `json:"status"`
+	Players         []GamePlayer  `json:"players"`
+	Scores          []PlayerScore `json:"scores"`
+	CurrentPlayerID string        `json:"currentPlayerId"`
+	History         []Throw       `json:"history"`
+	CreatedAt       time.Time     `json:"createdAt"`
+}
