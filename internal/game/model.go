@@ -25,6 +25,7 @@ type Game struct {
 	Status    string       `json:"status"`
 	Players   []GamePlayer `json:"players"`
 	CreatedAt time.Time    `json:"createdAt"`
+	WinnerID  *string      `json:"winnerId,omitempty"`
 }
 
 // CreateGameRequest matches EXACTLY what the frontend sends:
@@ -69,4 +70,5 @@ type GameState struct {
 	CurrentPlayerID string        `json:"currentPlayerId"`
 	History         []Throw       `json:"history"`
 	CreatedAt       time.Time     `json:"createdAt"`
+	WinnerID        *string       `json:"winnerId,omitempty"`
 }

@@ -65,6 +65,11 @@ CREATE TABLE IF NOT EXISTS throws (
 );
 `
 
+	const addWinnerColumn = `
+ALTER TABLE games
+ADD COLUMN IF NOT EXISTS winner_id UUID REFERENCES players(id);
+`
+
 	if _, err := db.Exec(ctx, enablePgcrypto); err != nil {
 		return err
 	}
@@ -75,6 +80,9 @@ CREATE TABLE IF NOT EXISTS throws (
 		return err
 	}
 	if _, err := db.Exec(ctx, throwsTable); err != nil {
+		return err
+	}
+	if _, err := db.Exec(ctx, addWinnerColumn); err != nil {
 		return err
 	}
 

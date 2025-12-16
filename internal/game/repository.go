@@ -98,6 +98,68 @@ func (r *Repository) GetGame(ctx context.Context, gameID string) (GameState, err
 	return state, nil
 }
 
+// ListGames returns recent games (without history/scores) for the history view.
+func (r *Repository) ListGames(ctx context.Context, limit int) ([]Game, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+
+	rows, err := r.db.Query(ctx, `
+SELECT id::text, mode, starting_score, legs, sets, double_out, status, created_at, winner_id
+FROM games
+ORDER BY created_at DESC
+LIMIT $1;
+`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	games := make([]Game, 0)
+	for rows.Next() {
+		var g Game
+		var startingScore *int
+		var winnerID *string
+
+		if err := rows.Scan(
+			&g.ID,
+			&g.Config.Mode,
+			&startingScore,
+			&g.Config.Legs,
+			&g.Config.Sets,
+			&g.Config.DoubleOut,
+			&g.Status,
+			&g.CreatedAt,
+			&winnerID,
+		); err != nil {
+			return nil, err
+		}
+
+		g.Config.StartingScore = startingScore
+		g.WinnerID = winnerID
+		games = append(games, g)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Load players for each game (simple N+1, fine for personal use).
+	for i := range games {
+		players, err := r.loadPlayersForGame(ctx, games[i].ID)
+		if err != nil {
+			return nil, err
+		}
+		games[i].Players = players
+	}
+
+	return games, nil
+}
+
+//
+// -----------------------------------------------------------------------------
+// Internal helpers
+// -----------------------------------------------------------------------------
+
 // getGameState reads from games + game_players + players + throws
 // and constructs a GameState with computed scores & current player.
 func (r *Repository) getGameState(ctx context.Context, gameID string) (GameState, error) {
@@ -106,7 +168,7 @@ func (r *Repository) getGameState(ctx context.Context, gameID string) (GameState
 
 	// Load game row
 	err := r.db.QueryRow(ctx, `
-SELECT id::text, mode, starting_score, legs, sets, double_out, status, created_at
+SELECT id::text, mode, starting_score, legs, sets, double_out, status, created_at, winner_id
 FROM games
 WHERE id = $1;
 `, gameID).Scan(
@@ -118,6 +180,7 @@ WHERE id = $1;
 		&state.Config.DoubleOut,
 		&state.Status,
 		&state.CreatedAt,
+		&state.WinnerID,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -127,6 +190,7 @@ WHERE id = $1;
 	}
 	state.Config.StartingScore = startingScore
 
+	// Load players (seating order)
 	players, err := r.loadPlayersForGame(ctx, state.ID)
 	if err != nil {
 		return GameState{}, err
@@ -168,6 +232,35 @@ ORDER BY created_at ASC, id ASC;
 	r.computeScores(&state)
 
 	return state, nil
+}
+
+// loadPlayersForGame loads the players for a single game (in seat order).
+func (r *Repository) loadPlayersForGame(ctx context.Context, gameID string) ([]GamePlayer, error) {
+	rows, err := r.db.Query(ctx, `
+SELECT p.id::text, p.name, gp.seat
+FROM game_players gp
+JOIN players p ON p.id = gp.player_id
+WHERE gp.game_id = $1
+ORDER BY gp.seat ASC;
+`, gameID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	players := make([]GamePlayer, 0)
+	for rows.Next() {
+		var gp GamePlayer
+		if err := rows.Scan(&gp.ID, &gp.Name, &gp.Seat); err != nil {
+			return nil, err
+		}
+		players = append(players, gp)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return players, nil
 }
 
 //
@@ -275,12 +368,11 @@ WHERE id = $1;
 }
 
 // computeScores fills state.Scores and state.CurrentPlayerId based on mode + history.
-// For now we implement an X01-like scoring model:
+// X01 rules implemented:
 //   - Starting score (default 501 if not provided)
 //   - Bust if score < 0
 //   - If double-out is enabled, leaving 1 is a bust (can't finish on 1)
-//   - Reaching 0 is considered checkout (we don't validate last dart is a double,
-//     because we don't have per-dart info yet).
+//   - Reaching 0 is a finish (we don't yet validate last dart as double).
 func (r *Repository) computeScores(state *GameState) {
 	if len(state.Players) == 0 {
 		state.Scores = []PlayerScore{}
@@ -308,8 +400,8 @@ func (r *Repository) computeScores(state *GameState) {
 		start = *state.Config.StartingScore
 	}
 
-	// Only track remaining for X01.
 	remaining := make([]int, len(state.Players))
+
 	if state.Config.Mode == "X01" {
 		for i := range remaining {
 			remaining[i] = start
@@ -362,120 +454,52 @@ func (r *Repository) computeScores(state *GameState) {
 	state.Scores = scores
 }
 
-// syncGameStatus updates the games.status field based on scores + history:
+// syncGameStatus updates the games.status and games.winner_id fields
+// based on scores + history:
 // - finished: any player has remaining == 0
 // - in_progress: at least one throw and no winner
 // - pending: no throws
 func (r *Repository) syncGameStatus(ctx context.Context, state *GameState) error {
-	newStatus := "pending"
-
-	finished := false
+	// Determine winner (if any) from scores.
+	var winnerID *string
 	for _, s := range state.Scores {
 		if s.Remaining != nil && *s.Remaining == 0 {
-			finished = true
+			id := s.PlayerID
+			winnerID = &id
 			break
 		}
 	}
 
-	if finished {
+	var newStatus string
+	if winnerID != nil {
 		newStatus = "finished"
 	} else if len(state.History) > 0 {
 		newStatus = "in_progress"
+	} else {
+		newStatus = "pending"
 	}
 
-	if newStatus == state.Status {
+	// Check if status or winner changed.
+	sameWinner := false
+	if state.WinnerID == nil && winnerID == nil {
+		sameWinner = true
+	} else if state.WinnerID != nil && winnerID != nil && *state.WinnerID == *winnerID {
+		sameWinner = true
+	}
+
+	if newStatus == state.Status && sameWinner {
 		return nil
 	}
 
 	if _, err := r.db.Exec(ctx, `
 UPDATE games
-SET status = $1
-WHERE id = $2;
-`, newStatus, state.ID); err != nil {
+SET status = $1, winner_id = $2
+WHERE id = $3;
+`, newStatus, winnerID, state.ID); err != nil {
 		return err
 	}
 
 	state.Status = newStatus
+	state.WinnerID = winnerID
 	return nil
-}
-
-// loadPlayersForGame loads the players for a single game (in seat order).
-func (r *Repository) loadPlayersForGame(ctx context.Context, gameID string) ([]GamePlayer, error) {
-	rows, err := r.db.Query(ctx, `
-SELECT p.id::text, p.name, gp.seat
-FROM game_players gp
-JOIN players p ON p.id = gp.player_id
-WHERE gp.game_id = $1
-ORDER BY gp.seat ASC;
-`, gameID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	players := make([]GamePlayer, 0)
-	for rows.Next() {
-		var gp GamePlayer
-		if err := rows.Scan(&gp.ID, &gp.Name, &gp.Seat); err != nil {
-			return nil, err
-		}
-		players = append(players, gp)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	return players, nil
-}
-
-// ListGames returns recent games (without history / scores) for the history view.
-func (r *Repository) ListGames(ctx context.Context, limit int) ([]Game, error) {
-	if limit <= 0 {
-		limit = 50
-	}
-
-	rows, err := r.db.Query(ctx, `
-SELECT id::text, mode, starting_score, legs, sets, double_out, status, created_at
-FROM games
-ORDER BY created_at DESC
-LIMIT $1;
-`, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	games := make([]Game, 0)
-	for rows.Next() {
-		var g Game
-		var startingScore *int
-		if err := rows.Scan(
-			&g.ID,
-			&g.Config.Mode,
-			&startingScore,
-			&g.Config.Legs,
-			&g.Config.Sets,
-			&g.Config.DoubleOut,
-			&g.Status,
-			&g.CreatedAt,
-		); err != nil {
-			return nil, err
-		}
-		g.Config.StartingScore = startingScore
-		games = append(games, g)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	// Load players for each game (simple N+1, fine for small personal app)
-	for i := range games {
-		players, err := r.loadPlayersForGame(ctx, games[i].ID)
-		if err != nil {
-			return nil, err
-		}
-		games[i].Players = players
-	}
-
-	return games, nil
 }
