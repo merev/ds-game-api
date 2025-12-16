@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -42,13 +43,14 @@ func (r *Repository) CreateGame(ctx context.Context, req CreateGameRequest) (Gam
 	}()
 
 	var gameID string
-	var createdAt pgx.NullTime // but we'll scan into time.Time directly
+	var createdAt time.Time
 
 	err = tx.QueryRow(ctx, `
 INSERT INTO games (mode, starting_score, legs, sets, double_out)
 VALUES ($1, $2, $3, $4, $5)
 RETURNING id::text, created_at;
-`, req.Mode, req.StartingScore, req.Legs, req.Sets, req.DoubleOut).Scan(&gameID, &createdAt)
+`, req.Mode, req.StartingScore, req.Legs, req.Sets, req.DoubleOut).
+		Scan(&gameID, &createdAt)
 	if err != nil {
 		return Game{}, err
 	}
@@ -96,7 +98,6 @@ WHERE id = $1;
 	}
 	g.Config.StartingScore = startingScore
 
-	// Load players
 	rows, err := r.db.Query(ctx, `
 SELECT p.id::text, p.name, gp.seat
 FROM game_players gp
