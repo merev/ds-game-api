@@ -109,3 +109,17 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
+
+// GET /api/games
+func (h *Handler) ListGames(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+
+	games, err := h.repo.ListGames(ctx, 50) // limit 50 for now
+	if err != nil {
+		http.Error(w, "failed to list games: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, games)
+}

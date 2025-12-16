@@ -127,30 +127,11 @@ WHERE id = $1;
 	}
 	state.Config.StartingScore = startingScore
 
-	// Load players (seating order)
-	rows, err := r.db.Query(ctx, `
-SELECT p.id::text, p.name, gp.seat
-FROM game_players gp
-JOIN players p ON p.id = gp.player_id
-WHERE gp.game_id = $1
-ORDER BY gp.seat ASC;
-`, state.ID)
+	players, err := r.loadPlayersForGame(ctx, state.ID)
 	if err != nil {
 		return GameState{}, err
 	}
-	defer rows.Close()
-
-	state.Players = make([]GamePlayer, 0)
-	for rows.Next() {
-		var gp GamePlayer
-		if err := rows.Scan(&gp.ID, &gp.Name, &gp.Seat); err != nil {
-			return GameState{}, err
-		}
-		state.Players = append(state.Players, gp)
-	}
-	if err := rows.Err(); err != nil {
-		return GameState{}, err
-	}
+	state.Players = players
 
 	// Load throws history
 	trows, err := r.db.Query(ctx, `
@@ -416,4 +397,85 @@ WHERE id = $2;
 
 	state.Status = newStatus
 	return nil
+}
+
+// loadPlayersForGame loads the players for a single game (in seat order).
+func (r *Repository) loadPlayersForGame(ctx context.Context, gameID string) ([]GamePlayer, error) {
+	rows, err := r.db.Query(ctx, `
+SELECT p.id::text, p.name, gp.seat
+FROM game_players gp
+JOIN players p ON p.id = gp.player_id
+WHERE gp.game_id = $1
+ORDER BY gp.seat ASC;
+`, gameID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	players := make([]GamePlayer, 0)
+	for rows.Next() {
+		var gp GamePlayer
+		if err := rows.Scan(&gp.ID, &gp.Name, &gp.Seat); err != nil {
+			return nil, err
+		}
+		players = append(players, gp)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return players, nil
+}
+
+// ListGames returns recent games (without history / scores) for the history view.
+func (r *Repository) ListGames(ctx context.Context, limit int) ([]Game, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+
+	rows, err := r.db.Query(ctx, `
+SELECT id::text, mode, starting_score, legs, sets, double_out, status, created_at
+FROM games
+ORDER BY created_at DESC
+LIMIT $1;
+`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	games := make([]Game, 0)
+	for rows.Next() {
+		var g Game
+		var startingScore *int
+		if err := rows.Scan(
+			&g.ID,
+			&g.Config.Mode,
+			&startingScore,
+			&g.Config.Legs,
+			&g.Config.Sets,
+			&g.Config.DoubleOut,
+			&g.Status,
+			&g.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		g.Config.StartingScore = startingScore
+		games = append(games, g)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Load players for each game (simple N+1, fine for small personal app)
+	for i := range games {
+		players, err := r.loadPlayersForGame(ctx, games[i].ID)
+		if err != nil {
+			return nil, err
+		}
+		games[i].Players = players
+	}
+
+	return games, nil
 }
