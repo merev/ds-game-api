@@ -367,16 +367,104 @@ WHERE id = $1;
 	return state, nil
 }
 
-// computeScores fills state.Scores and state.CurrentPlayerId based on mode + history.
+// -----------------------
+// Match helpers (legs & sets)
+// -----------------------
+
+func computeLegsWonInSet(set *SetScore) map[string]int {
+	wins := make(map[string]int)
+	if set == nil {
+		return wins
+	}
+	for _, leg := range set.Legs {
+		if leg.WinnerID == nil {
+			continue
+		}
+		wins[*leg.WinnerID]++
+	}
+	return wins
+}
+
+func computeSetsWon(match *MatchScore) map[string]int {
+	wins := make(map[string]int)
+	if match == nil {
+		return wins
+	}
+	for _, set := range match.Sets {
+		if set.WinnerID == nil {
+			continue
+		}
+		wins[*set.WinnerID]++
+	}
+	return wins
+}
+
+// startNextLegOrSet is used during reconstruction (computeScores) to decide
+// whether to create a new leg in the same set or start a new set.
+func startNextLegOrSet(match *MatchScore, start int, players []GamePlayer) {
+	if match == nil || len(players) == 0 {
+		return
+	}
+
+	currentSet := &match.Sets[match.CurrentSetIndex]
+
+	// helper to build initial scores for a fresh leg
+	newScoresByPlayer := func() map[string]int {
+		mp := make(map[string]int, len(players))
+		for _, p := range players {
+			mp[p.ID] = start
+		}
+		return mp
+	}
+
+	if currentSet.WinnerID != nil {
+		// Start a NEW SET
+		newSetNumber := len(match.Sets) + 1
+
+		newLeg := LegScore{
+			LegNumber:      1,
+			StartingScore:  start,
+			ScoresByPlayer: newScoresByPlayer(),
+		}
+
+		newSet := SetScore{
+			SetNumber: newSetNumber,
+			LegsToWin: currentSet.LegsToWin,
+			Legs:      []LegScore{newLeg},
+		}
+
+		match.Sets = append(match.Sets, newSet)
+		match.CurrentSetIndex = len(match.Sets) - 1
+		match.CurrentLegIndex = 0
+	} else {
+		// NEW LEG in the SAME SET
+		newLegNumber := len(currentSet.Legs) + 1
+
+		newLeg := LegScore{
+			LegNumber:      newLegNumber,
+			StartingScore:  start,
+			ScoresByPlayer: newScoresByPlayer(),
+		}
+
+		currentSet.Legs = append(currentSet.Legs, newLeg)
+		match.Sets[match.CurrentSetIndex] = *currentSet
+		match.CurrentLegIndex = len(currentSet.Legs) - 1
+	}
+}
+
+// computeScores fills state.Scores, state.CurrentPlayerID, and (for X01)
+// reconstructs the full legs/sets MatchScore from history.
+//
 // X01 rules implemented:
-//   - Starting score (default 501 if not provided)
-//   - Bust if score < 0
-//   - If double-out is enabled, leaving 1 is a bust (can't finish on 1)
-//   - Reaching 0 is a finish (we don't yet validate last dart as double).
+//   - Per-leg starting score (default 501 if not provided)
+//   - Bust if result < 0
+//   - If double-out is enabled, result == 1 is a bust (cannot finish on 1)
+//   - Reaching 0 finishes the leg; legs aggregate into sets; sets into match
 func (r *Repository) computeScores(state *GameState) {
 	if len(state.Players) == 0 {
 		state.Scores = []PlayerScore{}
 		state.CurrentPlayerID = ""
+		state.MatchScore = nil
 		return
 	}
 
@@ -394,79 +482,203 @@ func (r *Repository) computeScores(state *GameState) {
 		}
 	}
 
-	// Default starting score
+	// Non-X01 modes: keep simple scoring for now (no legs/sets)
+	if state.Config.Mode != "X01" {
+		state.Scores = scores
+
+		if len(state.History) == 0 {
+			state.CurrentPlayerID = state.Players[0].ID
+		} else {
+			last := state.History[len(state.History)-1]
+			if lastIdx, ok := playerIndex[last.PlayerID]; ok {
+				nextIdx := (lastIdx + 1) % len(state.Players)
+				state.CurrentPlayerID = state.Players[nextIdx].ID
+			} else {
+				state.CurrentPlayerID = state.Players[0].ID
+			}
+		}
+
+		state.MatchScore = nil
+		return
+	}
+
+	// ------------- X01 with legs & sets --------------
+
 	start := 501
 	if state.Config.StartingScore != nil {
 		start = *state.Config.StartingScore
 	}
 
-	remaining := make([]int, len(state.Players))
+	legsToWin := state.Config.Legs
+	if legsToWin <= 0 {
+		legsToWin = 1
+	}
+	setsToWin := state.Config.Sets
+	if setsToWin <= 0 {
+		setsToWin = 1
+	}
 
-	if state.Config.Mode == "X01" {
-		for i := range remaining {
-			remaining[i] = start
-			val := remaining[i]
-			scores[i].Remaining = &val
+	// Initial match structure: 1 set, 1 leg
+	initialScoresByPlayer := make(map[string]int, len(state.Players))
+	for _, p := range state.Players {
+		initialScoresByPlayer[p.ID] = start
+	}
+
+	firstLeg := LegScore{
+		LegNumber:      1,
+		StartingScore:  start,
+		ScoresByPlayer: initialScoresByPlayer,
+	}
+
+	firstSet := SetScore{
+		SetNumber: 1,
+		LegsToWin: legsToWin,
+		Legs:      []LegScore{firstLeg},
+	}
+
+	match := MatchScore{
+		SetsToWin:       setsToWin,
+		CurrentSetIndex: 0,
+		CurrentLegIndex: 0,
+		Sets:            []SetScore{firstSet},
+	}
+
+	// Per-player remaining for the CURRENT leg
+	remaining := make([]int, len(state.Players))
+	for i := range remaining {
+		remaining[i] = start
+		v := remaining[i]
+		scores[i].Remaining = &v
+		scores[i].LastVisit = nil
+		scores[i].LastThree = nil
+	}
+
+	var matchWinnerID *string
+
+	for _, t := range state.History {
+		if matchWinnerID != nil {
+			// ignore any garbage throws after match finish (shouldn't exist)
+			break
 		}
 
-		for _, t := range state.History {
-			idx, ok := playerIndex[t.PlayerID]
-			if !ok {
-				continue
-			}
+		idx, ok := playerIndex[t.PlayerID]
+		if !ok {
+			continue
+		}
 
-			cur := remaining[idx]
-			cand := cur - t.VisitScore
+		set := &match.Sets[match.CurrentSetIndex]
+		leg := &set.Legs[match.CurrentLegIndex]
 
-			// Bust rules:
-			// - If result < 0, bust (ignore this visit)
-			// - If double-out and result == 1, bust
-			if cand < 0 {
-				continue
-			}
-			if state.Config.DoubleOut && cand == 1 {
-				continue
-			}
+		// If leg already finished, next throw starts a new leg or set.
+		if leg.WinnerID != nil {
+			startNextLegOrSet(&match, start, state.Players)
+			set = &match.Sets[match.CurrentSetIndex]
+			leg = &set.Legs[match.CurrentLegIndex]
 
-			// Accept the visit
-			remaining[idx] = cand
-			visit := t.VisitScore
-			scores[idx].LastVisit = &visit
-			val := remaining[idx]
-			scores[idx].Remaining = &val
+			// Reset per-player remaining & last visit for new leg
+			for i := range remaining {
+				remaining[i] = start
+				v := remaining[i]
+				scores[i].Remaining = &v
+				scores[i].LastVisit = nil
+				scores[i].LastThree = nil
+			}
+		}
+
+		cur := leg.ScoresByPlayer[t.PlayerID]
+		if cur == 0 {
+			// In case the map got out of sync, fall back to tracked remaining
+			cur = remaining[idx]
+			if cur == 0 {
+				cur = start
+			}
+		}
+
+		cand := cur - t.VisitScore
+
+		// Bust rules:
+		// - result < 0 => bust
+		// - if double-out and result == 1 => bust
+		if cand < 0 || (state.Config.DoubleOut && cand == 1) {
+			// bust: ignore this visit for scoring, don't change remaining
+			continue
+		}
+
+		// Accept the visit
+		leg.ScoresByPlayer[t.PlayerID] = cand
+		remaining[idx] = cand
+
+		visit := t.VisitScore
+		scores[idx].LastVisit = &visit
+		v := remaining[idx]
+		scores[idx].Remaining = &v
+
+		// Checkout: leg finished
+		if cand == 0 {
+			now := t.CreatedAt
+			winner := t.PlayerID
+			leg.WinnerID = &winner
+			leg.FinishedAt = &now
+
+			legsWon := computeLegsWonInSet(set)
+			if legsWon[winner] >= set.LegsToWin {
+				set.WinnerID = &winner
+				set.FinishedAt = &now
+
+				setsWon := computeSetsWon(&match)
+				if setsWon[winner] >= match.SetsToWin {
+					matchWinnerID = &winner
+					break
+				}
+			}
 		}
 	}
+
+	state.Scores = scores
+	state.MatchScore = &match
+	state.WinnerID = matchWinnerID
 
 	// Determine current player based on last throw; if no throws, first player.
 	if len(state.History) == 0 {
 		state.CurrentPlayerID = state.Players[0].ID
 	} else {
 		last := state.History[len(state.History)-1]
-		lastIdx, ok := playerIndex[last.PlayerID]
-		if !ok {
-			state.CurrentPlayerID = state.Players[0].ID
-		} else {
+		if lastIdx, ok := playerIndex[last.PlayerID]; ok {
 			nextIdx := (lastIdx + 1) % len(state.Players)
 			state.CurrentPlayerID = state.Players[nextIdx].ID
+		} else {
+			state.CurrentPlayerID = state.Players[0].ID
 		}
 	}
-
-	state.Scores = scores
 }
 
 // syncGameStatus updates the games.status and games.winner_id fields
-// based on scores + history:
-// - finished: any player has remaining == 0
+// based on reconstructed match state:
+// - finished: some player has enough sets to win the match
 // - in_progress: at least one throw and no winner
 // - pending: no throws
 func (r *Repository) syncGameStatus(ctx context.Context, state *GameState) error {
-	// Determine winner (if any) from scores.
+	// Determine winner (if any).
 	var winnerID *string
-	for _, s := range state.Scores {
-		if s.Remaining != nil && *s.Remaining == 0 {
-			id := s.PlayerID
-			winnerID = &id
-			break
+
+	if state.MatchScore != nil {
+		// Prefer match-level winner (sets/legs)
+		setsWon := computeSetsWon(state.MatchScore)
+		for pid, cnt := range setsWon {
+			if cnt >= state.MatchScore.SetsToWin {
+				id := pid
+				winnerID = &id
+				break
+			}
+		}
+	} else {
+		// Fallback for non-X01 (or legacy): someone with remaining == 0
+		for _, s := range state.Scores {
+			if s.Remaining != nil && *s.Remaining == 0 {
+				id := s.PlayerID
+				winnerID = &id
+				break
+			}
 		}
 	}
 

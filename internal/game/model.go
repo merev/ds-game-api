@@ -61,6 +61,37 @@ type CreateThrowRequest struct {
 	DartsThrown int    `json:"dartsThrown"`
 }
 
+// -----------------------
+// Legs & Sets structures
+// -----------------------
+
+type LegScore struct {
+	LegNumber      int            `json:"legNumber"`
+	StartingScore  int            `json:"startingScore"`
+	ScoresByPlayer map[string]int `json:"scoresByPlayer"` // playerId -> remaining
+	WinnerID       *string        `json:"winnerId,omitempty"`
+	FinishedAt     *time.Time     `json:"finishedAt,omitempty"`
+}
+
+type SetScore struct {
+	SetNumber  int        `json:"setNumber"`
+	LegsToWin  int        `json:"legsToWin"`
+	Legs       []LegScore `json:"legs"`
+	WinnerID   *string    `json:"winnerId,omitempty"`
+	FinishedAt *time.Time `json:"finishedAt,omitempty"`
+}
+
+type MatchScore struct {
+	SetsToWin       int        `json:"setsToWin"`
+	CurrentSetIndex int        `json:"currentSetIndex"`
+	CurrentLegIndex int        `json:"currentLegIndex"`
+	Sets            []SetScore `json:"sets"`
+}
+
+// -----------------------
+// Full game state
+// -----------------------
+
 type GameState struct {
 	ID              string        `json:"id"`
 	Config          GameConfig    `json:"config"`
@@ -70,5 +101,10 @@ type GameState struct {
 	CurrentPlayerID string        `json:"currentPlayerId"`
 	History         []Throw       `json:"history"`
 	CreatedAt       time.Time     `json:"createdAt"`
-	WinnerID        *string       `json:"winnerId,omitempty"`
+
+	// NEW: full legs/sets structure
+	MatchScore *MatchScore `json:"matchScore,omitempty"`
+
+	// Match winner (mirrors games.winner_id)
+	WinnerID *string `json:"winnerId,omitempty"`
 }
