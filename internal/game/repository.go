@@ -620,6 +620,7 @@ func (r *Repository) computeScores(state *GameState) {
 			leg.WinnerID = &winner
 			leg.FinishedAt = &now
 
+			// Did this checkout also win the set / match?
 			legsWon := computeLegsWonInSet(set)
 			if legsWon[winner] >= set.LegsToWin {
 				set.WinnerID = &winner
@@ -629,6 +630,20 @@ func (r *Repository) computeScores(state *GameState) {
 				if setsWon[winner] >= match.SetsToWin {
 					matchWinnerID = &winner
 					break
+				}
+			}
+
+			// ✅ IMPORTANT: advance immediately to next leg/set (if match not finished)
+			if matchWinnerID == nil {
+				startNextLegOrSet(&match, start, state.Players)
+
+				// Reset per-player remaining & last visit for the new leg
+				for i := range remaining {
+					remaining[i] = start
+					v := remaining[i]
+					scores[i].Remaining = &v
+					scores[i].LastVisit = nil
+					scores[i].LastThree = nil
 				}
 			}
 		}
